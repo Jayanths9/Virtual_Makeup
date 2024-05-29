@@ -20,27 +20,27 @@ python image.py --image sample/face.png
 In this project Mediapipe [1] facial landmarks and opencv is used to add makeup on facial features.
 - Mediapipe facial landmark library detects the face in the image and returns 478 landmarks on human face. (x,y) coordinates of each points is obtained w.r.t the image size.
 
-<div style="text-align: center;">
-  <figure>
-    <img src="sample/facial_landmarks.jpeg" alt="Landmarks image">
-    <figcaption>Media pipe facial landmarks example [2] </figcaption>
-  </figure>
-</div>
-- From all the facial landmarks extract Lips,Eyebrow, Eyeliner & Eyeshadow points and create a colored mask w.r.to input image.
-<div style="text-align: center;">
-  <figure>
-    <img src="sample/mask.png" alt="mask",width="300" height="200">
-    <figcaption>Colored Mask for Lips, Eyebrow, Eyeliner & Eyeshadow </figcaption>
-  </figure>
-</div>
-- Blend the Original image and the mask w.r.to its weights to add makeup on the original image.
-<div style="text-align: center;">
-  <figure>
-    <img src="sample/comparison.png" alt="mask",width="500" height="300">
-    <figcaption>Original image and Transformed Image with Makeup [3]</figcaption>
-  </figure>
-</div>
+<p align="center">
+  <img src="sample/facial_landmarks.jpeg" alt="Landmarks image">
+  <br>
+  <b>Media pipe facial landmarks example [2]</b>
+</p>
 
+- From all the facial landmarks, extract Lips, Eyebrow, Eyeliner & Eyeshadow points and create a colored mask with respect to the input image.
+
+<p align="center">
+  <img src="sample/mask.png" alt="mask" width="200" height="200">
+  <br>
+  <b>Colored Mask for Lips, Eyebrow, Eyeliner & Eyeshadow</b>
+</p>
+
+- Blend the Original image and the mask with respect to its weights to add makeup on the original image.
+
+<p align="center">
+  <img src="sample/comparison.png" alt="mask" width="500" height="300">
+  <br>
+  <b>Original image and Transformed Image with Makeup [3]</b>
+</p>
 
 # Refrences
 1. https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
