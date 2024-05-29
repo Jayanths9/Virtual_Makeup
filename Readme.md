@@ -6,11 +6,11 @@ cd Virtual_Makeup_opencv
 conda env create -f environment.yml
 conda activate virtual_makeup
 ```
-### Run code on camera
+### Run on Camera input
 ```
 python camera.py
 ```
-### Run code on sample image
+### Run on sample image
 ```
 python image.py --image sample/face.png
 ```
