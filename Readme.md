@@ -43,7 +43,7 @@ In this project Mediapipe [1] facial landmarks and opencv is used to add makeup 
 </p>
 
 - Virtual Makeup on video.
-- 
+  
 <p align="center">
   <a href="sample/output_video.mp4">
     <img src="sample/000.png" alt="Watch the video" width="600" height="auto">
