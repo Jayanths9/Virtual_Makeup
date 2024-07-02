@@ -50,3 +50,4 @@ In this project Mediapipe [1] facial landmarks and opencv is used to add makeup 
 ---
 Author:
 Jayanth S
+universitat Bremen, Bremen
