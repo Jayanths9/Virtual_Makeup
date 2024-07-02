@@ -42,6 +42,8 @@ In this project Mediapipe [1] facial landmarks and opencv is used to add makeup 
   <b>Original image and Transformed Image with Makeup [3]</b>
 </p>
 
+[![Watch the video](sample/000.png)](sample/output_viedo.mp4)
+
 # Refrences
 1. https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
 2. https://medium.com/@hotakoma/mediapipe-landmark-face-hand-pose-sequence-number-list-view-778364d6c414
