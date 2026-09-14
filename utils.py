@@ -728,31 +728,57 @@ def adapt_style(style: dict, analysis: Analysis) -> dict:
 
 def _skin_mask(landmarks: np.ndarray, kernel: int):
     """
-    soft mask of the skin inside the face: the face oval without eyes, brows and lips, pulled
-    in from every edge so nothing gets a halo, then feathered. built at half size, it is smooth.
-    returns (mask, (x0, y0)) with the mask covering the face bounding box
+    soft mask of the skin inside the face: the face oval without eyes, brows and lips. the
+    outline is feathered widely so the foundation fades into the hairline and the neck instead
+    of stopping at a visible edge, the holes are grown a little so nothing gets a halo.
+    built at half size, it is smooth anyway.
+    returns (mask, (x0, y0)) with the mask covering the face box plus the feather margin
     """
     face = landmarks[face_points["FACE"]]
-    x0, y0 = np.maximum(face.min(axis=0) - kernel, 0)
-    x1, y1 = face.max(axis=0) + kernel + 1
+    margin = kernel * 3
+    x0, y0 = face.min(axis=0) - margin
+    x1, y1 = face.max(axis=0) + margin + 1
     width, height = int(x1 - x0), int(y1 - y0)
     offset = np.array((x0, y0))
     half = np.zeros((max(1, height // 2), max(1, width // 2)), np.float32)
     scale = lambda points: np.rint((points - offset) * 0.5).astype(np.int32)
     cv2.fillPoly(half, [scale(face)], 1.0)
-    holes = ("LEFT_EYE", "RIGHT_EYE", "EYEBROW_LEFT", "EYEBROW_RIGHT", "LIPS_OUTER")
-    cv2.fillPoly(half, [scale(landmarks[face_points[n]]) for n in holes], 0.0)
+    # the outline gets a wide feather
+    half = cv2.GaussianBlur(half, (0, 0), max(1.0, kernel * 0.75))
+    # the holes a narrow one, grown first so the feather does not reach into them
     k = max(3, (kernel // 2) | 1)
-    half = cv2.erode(half, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    half = cv2.GaussianBlur(half, (k, k), 0)
+    holes = np.zeros(half.shape, np.uint8)
+    for name in ("LEFT_EYE", "RIGHT_EYE", "EYEBROW_LEFT", "EYEBROW_RIGHT", "LIPS_OUTER"):
+        cv2.fillPoly(holes, [scale(landmarks[face_points[name]])], 255)
+    holes = cv2.dilate(holes, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1)))
+    holes = cv2.GaussianBlur(holes, (0, 0), max(1.0, k * 0.5)).astype(np.float32)
+    holes *= -1.0 / 255.0
+    holes += 1.0
+    half *= holes
     return cv2.resize(half, (width, height), interpolation=cv2.INTER_LINEAR), (int(x0), int(y0))
 
 
+def _skin_likeness(lab_quarter: np.ndarray, analysis: Analysis, size: tuple) -> np.ndarray:
+    """
+    0..1 per pixel: how close the colour is to the measured skin. hair, glasses, teeth and
+    background drop out, lighter or darker skin (highlights, shadows) stays in.
+    lab_quarter : opencv scale LAB of the region at quarter size
+    """
+    L, a, b = analysis.skin
+    target = np.array((L * 2.55, a + 128.0, b + 128.0), np.float32)
+    # judged on a blurred image: small blotches are part of the skin, not something else
+    diff = cv2.GaussianBlur(lab_quarter, (0, 0), 2.0) - target
+    distance = (diff[..., 0] / 90.0) ** 2 + (diff[..., 1] ** 2 + diff[..., 2] ** 2) / 13.0**2
+    likeness = np.exp(-0.5 * distance).astype(np.float32)
+    # anything that is not clearly skin (grey walls, hair, cloth) drops to exactly zero
+    likeness = np.clip((likeness - 0.2) / 0.8, 0.0, 1.0)
+    return cv2.resize(likeness, size, interpolation=cv2.INTER_LINEAR)
+
 
 def matched_foundation_shade(analysis: Analysis) -> tuple:
-    """(b, g, r) foundation that matches the measured skin: the skin colour, a touch lighter and less red"""
+    """(b, g, r) foundation matched to the measured skin: one shade lighter, a little less red"""
     L, a, b = analysis.skin
-    return _lab_to_bgr((L + 2.0, a * 0.85, b))
+    return _lab_to_bgr((min(L + 8.0, 96.0), a * 0.85, b))
 
 
 def apply_foundation(
@@ -777,8 +803,8 @@ def apply_foundation(
     coverage, smoothing = float(np.clip(coverage, 0, 1)), float(np.clip(smoothing, 0, 1))
     if coverage <= 0 and smoothing <= 0:
         return image
+    analysis = analysis or FaceAnalyzer().analyze(image, landmarks)
     if shade is None:
-        analysis = analysis or FaceAnalyzer().analyze(image, landmarks)
         shade = matched_foundation_shade(analysis)
     h, w = image.shape[:2]
     kernel = feather_size(landmarks)
@@ -791,31 +817,55 @@ def apply_foundation(
         return image
 
     region = image[cy0:y1, cx0:x1]
+    size = (region.shape[1], region.shape[0])
+    quarter_size = (max(1, size[0] // 4), max(1, size[1] // 4))
+    # only skin coloured pixels take foundation, so the wide feather can run into hair and
+    # background without tinting them. judged at quarter size, colour is smooth
+    quarter = cv2.cvtColor(cv2.resize(region, quarter_size, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB).astype(np.float32)
+    mask *= _skin_likeness(quarter, analysis, size)
+    # the full resolution work only covers what the mask really reaches
+    rows = np.nonzero(mask.max(axis=1) > 0.02)[0]
+    cols = np.nonzero(mask.max(axis=0) > 0.02)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return image
+    ry0, ry1, rx0, rx1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    mask, region = mask[ry0:ry1, rx0:rx1], region[ry0:ry1, rx0:rx1]
+    cy0, cx0, y1, x1 = cy0 + ry0, cx0 + rx0, cy0 + ry1, cx0 + rx1
+    size = (region.shape[1], region.shape[0])
+    quarter_size = (max(1, size[0] // 4), max(1, size[1] // 4))
+
     lab = cv2.cvtColor(region, cv2.COLOR_BGR2LAB).astype(np.float32)
     target = cv2.cvtColor(np.array([[shade]], np.uint8), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
     L, ab = lab[..., 0], lab[..., 1:]
-    size = (lab.shape[1], lab.shape[0])
+    quarter = cv2.resize(lab, quarter_size, interpolation=cv2.INTER_LINEAR)
 
     if coverage > 0:
         # colour is handled at half size (chroma is smooth, the eye cannot tell) and the evened
         # colour and local lightness, low frequency signals, at quarter size
         half = (max(1, size[0] // 2), max(1, size[1] // 2))
-        quarter = cv2.resize(lab, (max(1, size[0] // 4), max(1, size[1] // 4)), interpolation=cv2.INTER_AREA)
-        ab_half = cv2.resize(ab, half, interpolation=cv2.INTER_AREA)
-        c_half = cv2.resize(mask, half, interpolation=cv2.INTER_AREA)[..., None] * coverage
+        ab_half = cv2.resize(ab, half, interpolation=cv2.INTER_LINEAR)
+        c_half = cv2.resize(mask, half, interpolation=cv2.INTER_LINEAR)[..., None] * coverage
         # colour blotches (redness, spots) are smoothed away, then the colour is pulled toward
         # the shade. never fully flat, real skin keeps some variation
         even = cv2.resize(cv2.GaussianBlur(quarter[..., 1:], (0, 0), max(1.0, kernel * 0.25)), half, interpolation=cv2.INTER_LINEAR)
         ab_half += (even - ab_half) * c_half
         ab_half += (target[1:] - ab_half) * (c_half * 0.7)
         ab = cv2.resize(ab_half, size, interpolation=cv2.INTER_LINEAR)
-        # local dark or bright patches (under the eyes, shadows) move a little toward the
-        # shade. the low frequency part only, so shape shading is kept
-        low = cv2.resize(cv2.GaussianBlur(quarter[..., 0], (0, 0), max(1.0, kernel * 0.375)), size, interpolation=cv2.INTER_LINEAR)
-        L = L + (target[0] - low) * (mask * (coverage * 0.3))
+        # the whole area moves gently toward the lightness of the shade (a matched shade is a
+        # little lighter than the skin) and local dark patches (under the eyes, shadows) are
+        # lifted toward it. highlights are never darkened, and only the low frequency part
+        # moves, so the shape shading of the face is kept
+        c = mask * coverage
+        skin_L = analysis.skin[0] * 2.55
+        lift = cv2.resize(cv2.GaussianBlur(quarter[..., 0], (0, 0), max(1.0, kernel * 0.375)), size, interpolation=cv2.INTER_LINEAR)
+        np.subtract(target[0], lift, out=lift)
+        np.maximum(lift, 0, out=lift)
+        lift *= 0.35
+        lift += 0.6 * (target[0] - skin_L)
+        lift *= c
+        L += lift
 
     if smoothing > 0:
-        s = mask * smoothing
         source = np.clip(L, 0, 255).astype(np.uint8)
         # filter at half size when the face is big: faster, and finer texture goes with it
         scale = 0.5 if min(source.shape) > 200 else 1.0
@@ -824,9 +874,13 @@ def apply_foundation(
         smoothed = cv2.bilateralFilter(small, diameter, 30, diameter)
         if scale < 1:
             smoothed = cv2.resize(smoothed, (source.shape[1], source.shape[0]), interpolation=cv2.INTER_LINEAR)
-        L = L * (1 - s) + smoothed * s
+        delta = smoothed.astype(np.float32)
+        delta -= L
+        delta *= mask
+        delta *= smoothing
+        L += delta
 
-    lab[..., 0], lab[..., 1:] = L, ab
+    lab[..., 1:] = ab
     blended = cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     # only pixels the mask really covers are taken from the result, the colour round trip is lossy
     covered = (mask > 0.02).astype(np.float32)
