@@ -13,32 +13,92 @@ import mediapipe as mp
 import numpy as np
 
 
-# landmark indices of each facial feature polygon (mediapipe face mesh, 0..467)
-# BLUSH_*, LEFT_EYE, RIGHT_EYE and FACE are not used yet, kept for future features
+mp_face_mesh = mp.solutions.face_mesh
+
+
+def _chains(edges):
+    """
+    order an undirected edge set (like mediapipe's FACEMESH_* constants) into point chains.
+    returns [(points, closed), ...] where closed is True for a loop
+    """
+    adjacency = {}
+    for a, b in edges:
+        adjacency.setdefault(a, set()).add(b)
+        adjacency.setdefault(b, set()).add(a)
+    chains, seen = [], set()
+    # open chains must start at an end point (one neighbour), loops can start anywhere
+    for start in sorted(adjacency, key=lambda p: (len(adjacency[p]) != 1, p)):
+        if start in seen:
+            continue
+        chain, current = [start], start
+        seen.add(start)
+        while True:
+            unvisited = sorted(n for n in adjacency[current] if n not in seen)
+            if not unvisited:
+                break
+            current = unvisited[0]
+            chain.append(current)
+            seen.add(current)
+        chains.append((chain, start in adjacency[current] and len(chain) > 2))
+    return chains
+
+
+_MESH_NEIGHBOURS = {}
+for _a, _b in mp_face_mesh.FACEMESH_TESSELATION:
+    _MESH_NEIGHBOURS.setdefault(_a, set()).add(_b)
+    _MESH_NEIGHBOURS.setdefault(_b, set()).add(_a)
+
+
+def _loop(edges, containing=None):
+    """the closed loop in an edge set, or the one containing a given point if there are several"""
+    loops = [chain for chain, closed in _chains(edges) if closed]
+    if containing is not None:
+        loops = [chain for chain in loops if containing in chain]
+    assert len(loops) == 1, "expected exactly one loop"
+    return loops[0]
+
+
+def _band(edges):
+    """
+    close the two parallel open chains of an edge set (the top and bottom edge of an eyebrow)
+    into one polygon. if both chains run the same way their last points are mesh neighbours.
+    """
+    (a, _), (b, _) = _chains(edges)
+    return a + b[::-1] if b[-1] in _MESH_NEIGHBOURS[a[-1]] else a + b
+
+
+# landmark indices of each facial feature polygon (mediapipe face mesh, 0..467).
+# eyes, eyebrows, lips and the face oval are derived from the contours mediapipe ships, so they
+# cannot drift from the library. mediapipe names sides from the subjects point of view, this
+# project names them as seen in the image, hence the swap.
+# eyeshadow and eyeliner have no canonical contour and are picked by hand.
+# BLUSH_* and FACE are not used yet, kept for future features.
 face_points = {
-    "BLUSH_LEFT": [50],
-    "BLUSH_RIGHT": [280],
-    "LEFT_EYE": [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7],
-    "RIGHT_EYE": [362, 298, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382],
-    "EYELINER_LEFT": [243, 112, 26, 22, 23, 24, 110, 25, 226, 130, 33, 7, 163, 144, 145, 153, 154, 155, 133],
-    "EYELINER_RIGHT": [463, 362, 382, 381, 380, 374, 373, 390, 249, 263, 359, 446, 255, 339, 254, 253, 252, 256, 341],
+    "LEFT_EYE": _loop(mp_face_mesh.FACEMESH_RIGHT_EYE),
+    "RIGHT_EYE": _loop(mp_face_mesh.FACEMESH_LEFT_EYE),
+    "EYEBROW_LEFT": _band(mp_face_mesh.FACEMESH_RIGHT_EYEBROW),
+    "EYEBROW_RIGHT": _band(mp_face_mesh.FACEMESH_LEFT_EYEBROW),
+    "LIPS_OUTER": _loop(mp_face_mesh.FACEMESH_LIPS, containing=0),
+    "LIPS_INNER": _loop(mp_face_mesh.FACEMESH_LIPS, containing=13),
+    "FACE": _loop(mp_face_mesh.FACEMESH_FACE_OVAL),
     "EYESHADOW_LEFT": [226, 247, 30, 29, 27, 28, 56, 190, 243, 173, 157, 158, 159, 160, 161, 246, 33, 130],
     "EYESHADOW_RIGHT": [463, 414, 286, 258, 257, 259, 260, 467, 446, 359, 263, 466, 388, 387, 386, 385, 384, 398, 362],
-    "FACE": [152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10, 338, 297, 332, 284, 251, 389, 454, 323, 401, 361, 435, 288, 397, 365, 379, 378, 400, 377],
-    "LIP_UPPER": [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 308, 415, 310, 312, 13, 82, 81, 80, 191, 78],
-    "LIP_LOWER": [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 402, 317, 14, 87, 178, 88, 95, 78],
-    "EYEBROW_LEFT": [55, 107, 66, 105, 63, 70, 46, 53, 52, 65],
-    "EYEBROW_RIGHT": [285, 336, 296, 334, 293, 300, 276, 283, 295],
+    "EYELINER_LEFT": [243, 112, 26, 22, 23, 24, 110, 25, 226, 130, 33, 7, 163, 144, 145, 153, 154, 155, 133],
+    "EYELINER_RIGHT": [463, 362, 382, 381, 380, 374, 373, 390, 249, 263, 359, 446, 255, 339, 254, 253, 252, 256, 341],
+    "BLUSH_LEFT": [50],
+    "BLUSH_RIGHT": [280],
 }
+assert all(0 <= i < 468 for points in face_points.values() for i in points), "landmark index out of range"
 
-# the features a user can control, in painting order. each one paints a set of polygons.
+# the features a user can control, in painting order. each one paints a set of polygons and
+# cuts out its holes (the mouth opening for the lips).
 # "lightness" is how strongly the lightness of the skin follows the chosen colour:
 # 0 keeps the skin shading and texture fully, 1 paints a flat colour.
 FEATURES = {
-    "lips": {"label": "Lips", "polygons": ["LIP_UPPER", "LIP_LOWER"], "lightness": 0.25},
-    "eyeshadow": {"label": "Eyeshadow", "polygons": ["EYESHADOW_LEFT", "EYESHADOW_RIGHT"], "lightness": 0.10},
-    "eyeliner": {"label": "Eyeliner", "polygons": ["EYELINER_LEFT", "EYELINER_RIGHT"], "lightness": 0.60},
-    "eyebrows": {"label": "Eyebrows", "polygons": ["EYEBROW_LEFT", "EYEBROW_RIGHT"], "lightness": 0.30},
+    "lips": {"label": "Lips", "polygons": ["LIPS_OUTER"], "holes": ["LIPS_INNER"], "lightness": 0.25},
+    "eyeshadow": {"label": "Eyeshadow", "polygons": ["EYESHADOW_LEFT", "EYESHADOW_RIGHT"], "holes": [], "lightness": 0.10},
+    "eyeliner": {"label": "Eyeliner", "polygons": ["EYELINER_LEFT", "EYELINER_RIGHT"], "holes": [], "lightness": 0.60},
+    "eyebrows": {"label": "Eyebrows", "polygons": ["EYEBROW_LEFT", "EYEBROW_RIGHT"], "holes": [], "lightness": 0.30},
 }
 
 PRESETS_FILE = Path(__file__).with_name("presets.json")
@@ -84,7 +144,6 @@ def load_presets(path=PRESETS_FILE) -> dict:
 
 
 # initialize mediapipe functions
-mp_face_mesh = mp.solutions.face_mesh
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 
 # tiny frame used to run each model once right after it is created
@@ -216,6 +275,8 @@ def render_makeup(image: np.ndarray, landmarks: np.ndarray, style: dict) -> np.n
         # soft coverage mask of the feature, 0..alpha
         mask = np.zeros((y1 - y0, x1 - x0), np.float32)
         cv2.fillPoly(mask, [p - (x0, y0) for p in polygons], 1.0)
+        if spec["holes"]:
+            cv2.fillPoly(mask, [landmarks[face_points[h]] - (x0, y0) for h in spec["holes"]], 0.0)
         mask = cv2.GaussianBlur(mask, (kernel, kernel), 0) * entry["alpha"]
         # blend in LAB inside the box
         target = _bgr_to_lab(entry["color"])
