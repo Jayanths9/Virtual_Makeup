@@ -2,6 +2,7 @@ import contextlib
 import json
 import os
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -206,6 +207,198 @@ def create_segmenter(video: bool = False):
     return segmenter
 
 
+# webcam modes by name, smallest first
+CAMERA_MODES = {
+    "480p": (640, 480),
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "1440p": (2560, 1440),
+    "4k": (3840, 2160),
+}
+CAMERA_RESOLUTION_CHOICES = ["auto", "detect", "max"] + list(CAMERA_MODES)
+# "auto" stops climbing here: above it the makeup pipeline itself gets slow
+AUTO_MAX_MODE = "1080p"
+# a mode has to keep at least this frame rate to count as usable for live video
+MIN_SMOOTH_FPS = 20.0
+# where the result of an "auto" probe is remembered per webcam
+CAMERA_CACHE = Path.home() / ".virtual_makeup" / "cameras.json"
+
+
+def _read_camera_cache() -> dict:
+    try:
+        with open(CAMERA_CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def camera_is_known(index: int) -> bool:
+    """True if an "auto" probe of this webcam was already done and remembered"""
+    return str(index) in _read_camera_cache()
+
+
+def _write_camera_cache(cache: dict):
+    try:
+        CAMERA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CAMERA_CACHE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except OSError:
+        pass  # remembering is a convenience, never a failure
+
+
+def _open_capture(index: int, size: tuple | None = None, mjpg: bool = False):
+    """open a webcam, optionally straight into a frame size and MJPG. None if it cannot be opened"""
+    # on windows the default (MSMF) backend can hang for a long time when opening the camera,
+    # DirectShow opens it immediately. other platforms use the default backend.
+    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+    params = []
+    if size is not None:
+        params += [cv2.CAP_PROP_FRAME_WIDTH, size[0], cv2.CAP_PROP_FRAME_HEIGHT, size[1]]
+    if mjpg:
+        params += [cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")]
+    capture = cv2.VideoCapture(index, backend, params)
+    if not capture.isOpened():
+        capture.release()
+        return None
+    return capture
+
+
+class _Camera:
+    """
+    a VideoCapture plus what it is currently set to. every property change is a multi second
+    stream rebuild on some drivers, so requests that change nothing are skipped.
+    """
+
+    def __init__(self, index: int, size: tuple | None = None, mjpg: bool = False):
+        self.index = index
+        self.capture = _open_capture(index, size, mjpg)
+        self.size = None
+        self.mjpg = mjpg
+        if self.capture is not None:
+            # the first frame after opening takes up to a second, get it out of the way so
+            # frame rate measurements are not skewed
+            ok, frame = self.capture.read()
+            self.size = (frame.shape[1], frame.shape[0]) if ok else None
+
+    def set_mode(self, size: tuple, mjpg: bool):
+        """request a frame size (and MJPG), return the size the camera actually delivers or None"""
+        if size != self.size:
+            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+            # a size change resets the format to the native one, MJPG must be requested after it
+            self.mjpg = False
+        if mjpg and not self.mjpg:
+            # cameras without MJPG ignore this and keep their native format
+            self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            self.mjpg = True
+        # drivers report a requested size without honouring it, only a real frame is proof
+        ok, frame = self.capture.read()
+        self.size = (frame.shape[1], frame.shape[0]) if ok else None
+        return self.size
+
+    def fps(self, frames: int = 8, budget: float = 0.5) -> float:
+        """frames per second the capture delivers right now, 0 if it stops delivering"""
+        start, count = time.perf_counter(), 0
+        while count < frames and time.perf_counter() - start < budget:
+            ok, _ = self.capture.read()
+            if not ok:
+                return 0.0
+            count += 1
+        return count / max(time.perf_counter() - start, 1e-6)
+
+    def reopen(self):
+        """a fresh capture in its default mode, the only way back from MJPG to the native format"""
+        self.capture.release()
+        self.__init__(self.index)
+
+
+def _probe(camera: _Camera, names: list, need_fps: bool):
+    """
+    climb through the given modes and return (size, mjpg) of the best usable one, or None.
+    with need_fps a mode must keep MIN_SMOOTH_FPS, first natively, then as MJPG.
+    """
+    best, tried_mjpg = None, False
+    for name in names:
+        size = CAMERA_MODES[name]
+        delivered = camera.set_mode(size, camera.mjpg)
+        if delivered is None or delivered[0] < size[0]:
+            # the camera cannot do this size, it will not do anything bigger either
+            break
+        if not need_fps or camera.fps() >= MIN_SMOOTH_FPS:
+            best = (size, camera.mjpg)
+            continue
+        # too slow uncompressed, a compressed stream may keep the frame rate up. one try:
+        # a camera that ignores the request the first time will ignore it every time
+        if not tried_mjpg:
+            tried_mjpg = True
+            delivered = camera.set_mode(size, True)
+            if delivered and delivered[0] >= size[0] and camera.fps() >= MIN_SMOOTH_FPS:
+                best = (size, True)
+                continue
+        break
+    return best
+
+
+def open_camera(index: int = 0, resolution: str = "auto"):
+    """
+    index : webcam number
+    resolution : "auto"   - the largest mode up to AUTO_MAX_MODE that still runs smoothly.
+                            bigger modes on a webcam are often upscaled by the driver and run at
+                            a fraction of the frame rate, so this is measured, not assumed. the
+                            result is remembered in CAMERA_CACHE, later starts skip the probing
+                 "detect" - like auto, but measures again and updates the cache
+                 "max"    - the largest size the camera delivers, whatever the frame rate
+                 a name from CAMERA_MODES ("720p") - that mode
+    returns an opened cv2.VideoCapture, or None if the camera cannot be opened
+    """
+    cache = _read_camera_cache()
+    if resolution == "auto" and str(index) in cache:
+        # open straight into the remembered mode, every later property change costs seconds
+        remembered = cache[str(index)]
+        camera = _Camera(index, tuple(remembered["size"]), remembered["mjpg"])
+        return camera.capture
+    if resolution in CAMERA_MODES:
+        camera = _Camera(index, CAMERA_MODES[resolution])
+        if camera.capture is not None and camera.fps() < MIN_SMOOTH_FPS:
+            camera.set_mode(CAMERA_MODES[resolution], True)
+        return camera.capture
+
+    camera = _Camera(index)
+    if camera.capture is None:
+        return None
+    if resolution in ("auto", "detect", "max"):
+        names = list(CAMERA_MODES)
+        if resolution != "max":
+            names = names[: names.index(AUTO_MAX_MODE) + 1]
+        best = _probe(camera, names, need_fps=resolution != "max")
+        if best is None:
+            # not even the smallest mode works smoothly, keep whatever the camera is in now
+            return camera.capture
+        if resolution != "max":
+            cache[str(index)] = {"size": list(best[0]), "mjpg": best[1]}
+            _write_camera_cache(cache)
+        if camera.mjpg and not best[1]:
+            camera.reopen()
+            if camera.capture is None:
+                return None
+        camera.set_mode(best[0], best[1])
+        return camera.capture
+
+    raise ValueError(f"unknown resolution {resolution!r}, expected one of {CAMERA_RESOLUTION_CHOICES}")
+
+
+def camera_resolution(capture) -> tuple:
+    """(width, height) the capture is delivering"""
+    return int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+
+def camera_format(capture) -> str:
+    """four character code of the frame format the capture is delivering, e.g. YUY2 or MJPG"""
+    code = int(capture.get(cv2.CAP_PROP_FOURCC))
+    name = "".join(chr((code >> (8 * i)) & 0xFF) for i in range(4))
+    return name if name.isprintable() and name.strip() else "?"
+
+
 # to display image in cv2 window
 def show_image(image: np.ndarray, msg: str = "Virtual Makeup"):
     """
@@ -314,12 +507,16 @@ def blur_background(image: np.ndarray, segmenter, strength: float = 0.05):
     returns the image with everything except the person blurred
     """
     h, w = image.shape[:2]
+    # the model works on a small input anyway, feed it a downscaled frame to save the conversion
+    small = cv2.resize(image, (w // 4, h // 4), interpolation=cv2.INTER_AREA) if min(h, w) >= 480 else image
     # per pixel probability of being the person, 0..1, mediapipe expects RGB
-    mask = segmenter.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).segmentation_mask
+    mask = segmenter.process(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)).segmentation_mask
     # tighten the transition, then feather it so the cut-out edge is not jagged
     mask = np.clip((mask - 0.3) / 0.4, 0, 1)
-    mask = cv2.GaussianBlur(mask, (0, 0), max(1.0, min(h, w) / 200))[..., None]
-    # kernel scales with image size so the effect looks the same at any resolution
-    kernel = max(3, int(min(h, w) * strength) | 1)
-    blurred = cv2.stackBlur(image, (kernel, kernel))
-    return (image * mask + blurred * (1 - mask)).astype(np.uint8)
+    mask = cv2.GaussianBlur(mask, (0, 0), max(1.0, min(mask.shape) / 200))
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+    # a blur is low frequency, so blur a quarter-size copy and scale it back up: same look,
+    # a fraction of the cost at high resolutions. kernel scales with size so the look is stable.
+    kernel = max(3, int(min(small.shape[:2]) * strength) | 1)
+    blurred = cv2.resize(cv2.stackBlur(small, (kernel, kernel)), (w, h), interpolation=cv2.INTER_LINEAR)
+    return cv2.blendLinear(image, blurred, mask, 1 - mask)

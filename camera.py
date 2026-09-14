@@ -3,20 +3,36 @@ import sys
 
 import cv2
 
-from utils import apply_makeup, blur_background, create_face_mesh, create_segmenter, load_presets
+from utils import (
+    CAMERA_RESOLUTION_CHOICES,
+    apply_makeup,
+    blur_background,
+    camera_format,
+    camera_resolution,
+    create_face_mesh,
+    create_segmenter,
+    load_presets,
+    open_camera,
+)
+
+WINDOW = "Virtual Makeup"
+DISPLAY_MAX_WIDTH = 1280
 
 
-def main(preset=None, blur_bg=False):
+def main(preset=None, blur_bg=False, resolution="auto"):
     presets = load_presets()
     names = list(presets)
     current = names.index(preset) if preset else 0
 
-    # on windows the default (MSMF) backend can hang for a long time when opening the camera,
-    # DirectShow opens it immediately. other platforms use the default backend.
-    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-    video_capture = cv2.VideoCapture(0, backend)
-    if not video_capture.isOpened():
+    if resolution == "auto":
+        print("Detecting the best webcam mode...")
+    video_capture = open_camera(0, resolution)
+    if video_capture is None:
         sys.exit("Could not open camera.")
+    width, height = camera_resolution(video_capture)
+    print(f"Camera: {width}x{height} {camera_format(video_capture)}")
+    # frames wider than the display size are scaled down properly before showing
+    display_width = min(width, DISPLAY_MAX_WIDTH)
 
     # create the models once and reuse them for every frame, tracking mode for video
     with create_face_mesh(static_image_mode=False) as face_mesh, create_segmenter(video=True) as segmenter:
@@ -33,7 +49,10 @@ def main(preset=None, blur_bg=False):
             # blur everything except the person
             if blur_bg:
                 output = blur_background(output, segmenter)
-            cv2.imshow("Virtual Makeup", output)
+            if output.shape[1] > display_width:
+                scale = display_width / output.shape[1]
+                output = cv2.resize(output, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            cv2.imshow(WINDOW, output)
             # q quits, b toggles the background blur, 1..9 switch preset
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -52,5 +71,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Webcam with facial makeup")
     parser.add_argument("--preset", choices=preset_names, default=preset_names[0], help="Makeup preset from presets.json.")
     parser.add_argument("--blur-background", action="store_true", help="Start with the background blurred (press b to toggle).")
+    parser.add_argument("--resolution", choices=CAMERA_RESOLUTION_CHOICES, default="auto",
+                        help="Webcam mode: auto picks the largest that still runs smoothly (default).")
     args = parser.parse_args()
-    main(preset=args.preset, blur_bg=args.blur_background)
+    main(preset=args.preset, blur_bg=args.blur_background, resolution=args.resolution)

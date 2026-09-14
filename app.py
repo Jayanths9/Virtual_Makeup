@@ -41,16 +41,29 @@ from utils import (
     FEATURES,
     bgr_to_hex,
     blur_background,
+    camera_format,
+    camera_is_known,
+    camera_resolution,
     create_face_mesh,
     create_segmenter,
     detect_landmarks,
     hex_to_bgr,
     load_presets,
+    open_camera,
     render_makeup,
 )
 
 ACCENT = "#e0567a"
 CAMERA_SLOTS = 3  # "Webcam 0..2" entries in the source list, an opened image goes after them
+# quality dropdown: label -> open_camera resolution argument
+QUALITY_OPTIONS = {
+    "Auto": "auto",
+    "480p": "480p",
+    "720p": "720p",
+    "1080p": "1080p",
+    "Max": "max",
+    "Auto (detect again)": "detect",
+}
 
 STYLESHEET = """
 QWidget { background: #17181c; color: #e8e8ea; font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; font-size: 13px; }
@@ -123,13 +136,14 @@ class Processor(QThread):
 
     frame_ready = Signal(QImage, bool)  # rendered frame, face found
     fps_changed = Signal(float)
+    source_changed = Signal(str)  # human readable description of the active source
     failed = Signal(str)
 
     def __init__(self, settings: Settings):
         super().__init__()
         self._lock = QMutex()
         self._settings = settings
-        self._source = ("camera", 0)  # ("camera", index) or ("image", ndarray)
+        self._source = ("camera", (0, "auto"))  # ("camera", (index, resolution)) or ("image", ndarray)
         self._version = 0  # bumped on every settings / source change
         self._running = True
         self._last_error = None
@@ -140,9 +154,9 @@ class Processor(QThread):
             self._settings = settings
             self._version += 1
 
-    def use_camera(self, index: int = 0):
+    def use_camera(self, index: int = 0, resolution: str = "auto"):
         with QMutexLocker(self._lock):
-            self._source = ("camera", index)
+            self._source = ("camera", (index, resolution))
             self._version += 1
 
     def use_image(self, image):
@@ -169,17 +183,24 @@ class Processor(QThread):
                 settings, (kind, payload), version = self._settings, self._source, self._version
 
             if kind == "camera":
+                index, resolution = payload
                 if capture is None or capture_index != payload:
                     if capture is not None:
                         capture.release()
-                    capture, capture_index = self._open_camera(payload), payload
+                    if resolution in ("detect", "max") or (resolution == "auto" and not camera_is_known(index)):
+                        self.failed.emit(f"Measuring which modes webcam {index} runs smoothly, about 15 s, only once…")
+                    else:
+                        self.failed.emit(f"Opening webcam {index}…")
+                    capture, capture_index = open_camera(index, resolution), payload
                     if capture is None:
-                        self._report(f"Could not open webcam {payload}")
+                        self._report(f"Could not open webcam {index}")
                         self.msleep(500)
                         continue
+                    width, height = camera_resolution(capture)
+                    self.source_changed.emit(f"Webcam {index}  {width}x{height} {camera_format(capture)}")
                 ok, frame = capture.read()
                 if not ok:
-                    self._report(f"Webcam {payload} stopped delivering frames")
+                    self._report(f"Webcam {index} stopped delivering frames")
                     capture.release()
                     capture = None
                     self.msleep(500)
@@ -197,6 +218,7 @@ class Processor(QThread):
                 frame = payload
                 if id(payload) != image_id:
                     image_landmarks, image_id = detect_landmarks(frame, face_static), id(payload)
+                    self.source_changed.emit(f"Image  {frame.shape[1]}x{frame.shape[0]}")
                 landmarks = image_landmarks
                 rendered_version = version
 
@@ -229,15 +251,6 @@ class Processor(QThread):
             self._last_error = message
             self.failed.emit(message)
 
-    @staticmethod
-    def _open_camera(index):
-        # on windows the default (MSMF) backend can hang for a long time when opening the camera
-        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-        capture = cv2.VideoCapture(index, backend)
-        if not capture.isOpened():
-            capture.release()
-            return None
-        return capture
 
 
 class VideoView(QWidget):
@@ -364,9 +377,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.face_label = QLabel("")
+        self.source_label = QLabel("")
+        self.source_label.setObjectName("dim")
         self.fps_label = QLabel("")
         self.fps_label.setObjectName("dim")
         self.statusBar().addPermanentWidget(self.face_label)
+        self.statusBar().addPermanentWidget(self.source_label)
         self.statusBar().addPermanentWidget(self.fps_label)
         self.statusBar().showMessage("B blur   C compare   Ctrl+O open image   Ctrl+S snapshot   Q quit")
 
@@ -374,6 +390,7 @@ class MainWindow(QMainWindow):
         self.processor = Processor(self._settings())
         self.processor.frame_ready.connect(self._on_frame)
         self.processor.fps_changed.connect(self._on_fps)
+        self.processor.source_changed.connect(self.source_label.setText)
         self.processor.failed.connect(self.view.set_message)
         self.processor.start()
         self._add_shortcuts()
@@ -396,14 +413,25 @@ class MainWindow(QMainWindow):
         column.addWidget(subtitle)
 
         source_box = QGroupBox("Source")
-        row = QHBoxLayout(source_box)
         self.source_combo = QComboBox()
         self.source_combo.addItems([f"Webcam {i}" for i in range(CAMERA_SLOTS)])
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         open_button = QPushButton("Open image…")
         open_button.clicked.connect(self._open_image_dialog)
-        row.addWidget(self.source_combo, 1)
-        row.addWidget(open_button)
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(list(QUALITY_OPTIONS))
+        self.quality_combo.setToolTip(
+            "Auto measures the frame rate and picks the largest mode that still runs smoothly. "
+            "Max takes the largest size the camera has, whatever the frame rate."
+        )
+        self.quality_combo.currentIndexChanged.connect(self._on_source_changed)
+        quality_label = QLabel("Quality")
+        quality_label.setObjectName("dim")
+        grid = QGridLayout(source_box)
+        grid.addWidget(self.source_combo, 0, 0, 1, 2)
+        grid.addWidget(open_button, 0, 2)
+        grid.addWidget(quality_label, 1, 0)
+        grid.addWidget(self.quality_combo, 1, 1, 1, 2)
         column.addWidget(source_box)
 
         preset_box = QGroupBox("Preset")
@@ -507,10 +535,11 @@ class MainWindow(QMainWindow):
         self._push_settings()
 
     # ---- sources
-    def _on_source_changed(self, index: int):
+    def _on_source_changed(self, *_):
+        index = self.source_combo.currentIndex()
         if index < CAMERA_SLOTS:
             self.view.set_message(f"Starting webcam {index}…")
-            self.processor.use_camera(index)
+            self.processor.use_camera(index, QUALITY_OPTIONS[self.quality_combo.currentText()])
         elif self._image is not None:
             self.processor.use_image(self._image)
 
