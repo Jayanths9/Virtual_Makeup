@@ -5,15 +5,20 @@ import cv2
 
 from utils import (
     CAMERA_RESOLUTION_CHOICES,
-    apply_makeup,
+    FaceAnalyzer,
+    adapt_style,
     blur_background,
     camera_format,
     camera_resolution,
     create_face_mesh,
     create_segmenter,
+    detect_landmarks,
     load_presets,
     open_camera,
     probe_camera,
+    render_makeup,
+    apply_foundation,
+    hex_to_bgr,
 )
 
 WINDOW = "Virtual Makeup"
@@ -33,10 +38,11 @@ def test_camera(index=0):
         print("  %-7s %-11s %-7s %5.1f     %s" % (row["mode"], "%dx%d" % row["size"], row["format"], row["fps"], verdict))
 
 
-def main(preset=None, blur_bg=False, resolution="auto"):
+def main(preset=None, blur_bg=False, resolution="auto", adaptive=True, coverage=0.0, smoothing=0.0, shade=None):
     presets = load_presets()
     names = list(presets)
     current = names.index(preset) if preset else 0
+    analyzer = FaceAnalyzer()
 
     if resolution == "auto":
         print("Detecting the best webcam mode...")
@@ -56,10 +62,17 @@ def main(preset=None, blur_bg=False, resolution="auto"):
             if not success:
                 break
             image = cv2.flip(image, 1)
-            # blend the makeup into the frame, show the raw frame if no face is found
-            output = apply_makeup(image, face_mesh, presets[names[current]])
-            if output is None:
+            # adapt the shades, smooth the skin and blend the makeup in, raw frame if no face is found
+            landmarks = detect_landmarks(image, face_mesh)
+            if landmarks is None:
                 output = image
+            else:
+                style = presets[names[current]]
+                analysis = analyzer.update(image, landmarks)
+                if adaptive:
+                    style = adapt_style(style, analysis)
+                output = apply_foundation(image, landmarks, coverage, smoothing, shade, analysis)
+                output = render_makeup(output, landmarks, style)
             # blur everything except the person
             if blur_bg:
                 output = blur_background(output, segmenter)
@@ -88,8 +101,14 @@ if __name__ == "__main__":
     parser.add_argument("--resolution", choices=CAMERA_RESOLUTION_CHOICES, default="auto",
                         help="Webcam mode: auto picks the largest that still runs smoothly (default).")
     parser.add_argument("--test", action="store_true", help="Measure every webcam mode, print the results and exit.")
+    parser.add_argument("--no-adapt", action="store_true", help="Use the preset shades as they are instead of adapting them to skin and light.")
+    parser.add_argument("--foundation", type=float, default=0.0, metavar="0..1", help="Foundation coverage, evens out the skin colour (default 0 = off).")
+    parser.add_argument("--smooth", type=float, default=0.0, metavar="0..1", help="Foundation texture smoothing (default 0).")
+    parser.add_argument("--foundation-shade", metavar="#rrggbb", help="Foundation shade, matched to the skin when not given.")
     args = parser.parse_args()
     if args.test:
         test_camera()
     else:
-        main(preset=args.preset, blur_bg=args.blur_background, resolution=args.resolution)
+        main(preset=args.preset, blur_bg=args.blur_background, resolution=args.resolution,
+             adaptive=not args.no_adapt, coverage=args.foundation, smoothing=args.smooth,
+             shade=hex_to_bgr(args.foundation_shade) if args.foundation_shade else None)

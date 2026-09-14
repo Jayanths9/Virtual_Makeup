@@ -540,6 +540,301 @@ def render_makeup(image: np.ndarray, landmarks: np.ndarray, style: dict) -> np.n
     return output
 
 
+# ---------------------------------------------------------------------------------------------
+# adapting shades to the person and the lighting
+#
+# skin is sampled on the cheeks, forehead and chin and described in real L*a*b*: L* is how deep
+# the skin tone is (and how bright the light), the hue angle of a*/b* is the undertone (warm =
+# yellow, cool = pink). the presets were tuned on the sample face, so shades are moved relative
+# to that reference: pulled toward the skin undertone, darkened or lightened with skin depth,
+# given more chroma on deeper skin where a pale shade would vanish, and scaled in intensity
+# with the brightness of the image. eyebrows take the persons own brow colour, darkened.
+# ---------------------------------------------------------------------------------------------
+
+# skin of the sample face the presets were designed on, real L*a*b*
+REFERENCE_SKIN = (66.0, 16.0, 17.0)
+# landmarks whose surroundings are sampled for skin colour: both cheeks, forehead, chin
+SKIN_PATCHES = ([50, 101, 118, 205], [280, 330, 347, 425], [9, 108, 337, 151, 69, 299], [199, 200, 208, 428])
+# how far each feature follows the skin: (undertone pull on b*, undertone pull on a*, depth follow on L*)
+ADAPT_WEIGHTS = {
+    "lips": (0.5, 0.3, 0.5),
+    "eyeshadow": (0.6, 0.4, 0.6),
+    "eyeliner": (0.2, 0.1, 0.25),
+    "eyebrows": (0.0, 0.0, 0.0),  # brows use the persons own brow colour instead
+}
+
+
+def _to_real_lab(lab_uint8: np.ndarray) -> np.ndarray:
+    """opencv 8 bit LAB -> real L* 0..100, a*/b* -128..127"""
+    lab = lab_uint8.astype(np.float32)
+    lab[..., 0] *= 100.0 / 255.0
+    lab[..., 1:] -= 128.0
+    return lab
+
+
+def _lab_to_bgr(lab) -> tuple:
+    """
+    real L*a*b* -> (b, g, r). a shade pushed outside what sRGB can show keeps its lightness and
+    hue and loses only as much chroma as needed, instead of the hue shift plain clipping causes.
+    """
+    L, a, b = (float(v) for v in lab)
+    scale = 1.0
+    for _ in range(8):
+        pixel = np.array([[[L, a * scale, b * scale]]], np.float32)
+        bgr = cv2.cvtColor(pixel, cv2.COLOR_LAB2BGR)[0, 0]
+        if bgr.min() >= -0.002 and bgr.max() <= 1.002:
+            break
+        scale *= 0.85
+    return tuple(int(round(float(np.clip(c, 0, 1)) * 255)) for c in bgr)
+
+
+class Analysis:
+    """what was measured on a face: skin and brow colour in real L*a*b*, frame brightness"""
+
+    def __init__(self, skin, brow, frame_light):
+        self.skin = tuple(float(v) for v in skin)
+        self.brow = tuple(float(v) for v in brow)
+        self.frame_light = float(frame_light)
+
+    @property
+    def depth(self) -> str:
+        """individual typology angle, the dermatology scale for skin depth"""
+        L, _, b = self.skin
+        ita = np.degrees(np.arctan2(L - 50.0, max(b, 1e-3)))
+        for limit, name in ((55, "very light"), (41, "light"), (28, "medium"), (10, "tan"), (-30, "deep")):
+            if ita > limit:
+                return name
+        return "very deep"
+
+    @property
+    def undertone(self) -> str:
+        _, a, b = self.skin
+        hue = np.degrees(np.arctan2(b, max(a, 1e-3)))
+        return "warm" if hue > 55 else "cool" if hue < 40 else "neutral"
+
+    @property
+    def light(self) -> str:
+        L = self.frame_light
+        return "dark" if L < 25 else "dim" if L < 45 else "normal" if L < 70 else "bright"
+
+    def describe(self) -> str:
+        return f"{self.depth} {self.undertone} skin, {self.light} light"
+
+
+class FaceAnalyzer:
+    """
+    measures skin, brows and brightness for a frame. update() smooths over frames so live
+    video does not flicker between shades, analyze() is the raw measurement for a still image.
+    """
+
+    def __init__(self, smoothing: float = 0.1, every: int = 3):
+        self.smoothing = smoothing
+        self.every = every  # update() measures every n-th frame, skin does not change faster
+        self._state = None
+        self._calls = 0
+
+    def analyze(self, image: np.ndarray, landmarks: np.ndarray) -> Analysis:
+        h, w = image.shape[:2]
+        # everything is measured inside the face box, the frame can be much bigger than the face
+        face = landmarks[face_points["FACE"]]
+        x0, y0 = np.maximum(face.min(axis=0), 0)
+        x1, y1 = np.minimum(face.max(axis=0) + 1, (w, h))
+        if x1 <= x0 or y1 <= y0:
+            return Analysis(REFERENCE_SKIN, (20.0, 8.0, 8.0), 50.0)
+        offset = np.array((x0, y0))
+        lab = _to_real_lab(cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2LAB))
+        radius = max(3, int(np.linalg.norm(landmarks[33] - landmarks[263]) * 0.06))
+        # median colour of each patch, then the median across patches: one patch in shadow or
+        # under hair does not pull the result
+        patch_colours = []
+        for indices in SKIN_PATCHES:
+            mask = np.zeros(lab.shape[:2], np.uint8)
+            for i in indices:
+                cv2.circle(mask, (int(landmarks[i][0] - x0), int(landmarks[i][1] - y0)), radius, 1, -1)
+            pixels = lab[mask > 0]
+            if len(pixels) < 16:
+                continue
+            L = pixels[:, 0]
+            trimmed = pixels[(L > np.percentile(L, 10)) & (L < np.percentile(L, 90))]
+            patch_colours.append(np.median(trimmed if len(trimmed) else pixels, axis=0))
+        skin = np.median(patch_colours, axis=0) if patch_colours else np.array(REFERENCE_SKIN)
+        # brows: the darker part of the pixels inside the brow polygons is the hair, not skin
+        mask = np.zeros(lab.shape[:2], np.uint8)
+        brows = [landmarks[face_points[n]] - offset for n in ("EYEBROW_LEFT", "EYEBROW_RIGHT")]
+        cv2.fillPoly(mask, brows, 1)
+        pixels = lab[mask > 0]
+        if len(pixels):
+            dark = pixels[pixels[:, 0] <= np.percentile(pixels[:, 0], 40)]
+            brow = dark.mean(axis=0) if len(dark) else pixels.mean(axis=0)
+        else:
+            brow = np.array((20.0, 8.0, 8.0))
+        # brightness of the whole image
+        small = cv2.resize(image, (160, 120), interpolation=cv2.INTER_AREA)
+        frame_light = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[..., 0].mean() * 100.0 / 255.0
+        return Analysis(skin, brow, frame_light)
+
+    def update(self, image: np.ndarray, landmarks: np.ndarray) -> Analysis:
+        self._calls += 1
+        if self._state is None or self._calls % self.every == 0:
+            measured = self.analyze(image, landmarks)
+            vector = np.array([*measured.skin, *measured.brow, measured.frame_light], np.float32)
+            if self._state is None:
+                self._state = vector
+            else:
+                self._state = self._state * (1 - self.smoothing) + vector * self.smoothing
+        s = self._state
+        return Analysis(s[0:3], s[3:6], s[6])
+
+    def reset(self):
+        self._state = None
+        self._calls = 0
+
+
+def adapt_style(style: dict, analysis: Analysis) -> dict:
+    """
+    style : {feature: {"color": (b, g, r), "alpha": 0..1, "enabled": bool}} (a preset)
+    analysis : from FaceAnalyzer
+    returns a new style with the shades adapted to the person and the light
+    """
+    Ls, as_, bs = analysis.skin
+    ref_L, ref_a, ref_b = REFERENCE_SKIN
+    # deeper skin needs more chroma for the same visual effect
+    chroma = float(np.clip((ref_L / max(Ls, 20.0)) ** 0.35, 0.85, 1.4))
+    # dim images make makeup look heavy, bright ones wash it out
+    intensity = float(np.clip(1.0 + 0.4 * (analysis.frame_light - 40.0) / 40.0, 0.85, 1.15))
+
+    adapted = {}
+    for name, entry in style.items():
+        pull_b, pull_a, follow = ADAPT_WEIGHTS.get(name, (0.0, 0.0, 0.0))
+        lab = _to_real_lab(cv2.cvtColor(np.array([[entry["color"]]], np.uint8), cv2.COLOR_BGR2LAB))[0, 0]
+        if name == "eyebrows":
+            # the persons own brow hair, a little darker and richer, tinted by the chosen colour
+            own = np.array(analysis.brow, np.float32)
+            own[0] *= 0.75
+            own[1:] *= 1.1
+            lab = own * 0.7 + lab * 0.3
+        else:
+            lab[0] += follow * (Ls - ref_L)
+            lab[1] = (lab[1] + pull_a * (as_ - ref_a)) * chroma
+            lab[2] = (lab[2] + pull_b * (bs - ref_b)) * chroma
+        lab[0] = np.clip(lab[0], 5.0, 95.0)
+        adapted[name] = {
+            "color": _lab_to_bgr(lab),
+            "alpha": float(np.clip(entry["alpha"] * intensity, 0.0, 1.0)),
+            "enabled": entry["enabled"],
+        }
+    return adapted
+
+
+def _skin_mask(landmarks: np.ndarray, kernel: int):
+    """
+    soft mask of the skin inside the face: the face oval without eyes, brows and lips, pulled
+    in from every edge so nothing gets a halo, then feathered. built at half size, it is smooth.
+    returns (mask, (x0, y0)) with the mask covering the face bounding box
+    """
+    face = landmarks[face_points["FACE"]]
+    x0, y0 = np.maximum(face.min(axis=0) - kernel, 0)
+    x1, y1 = face.max(axis=0) + kernel + 1
+    width, height = int(x1 - x0), int(y1 - y0)
+    offset = np.array((x0, y0))
+    half = np.zeros((max(1, height // 2), max(1, width // 2)), np.float32)
+    scale = lambda points: np.rint((points - offset) * 0.5).astype(np.int32)
+    cv2.fillPoly(half, [scale(face)], 1.0)
+    holes = ("LEFT_EYE", "RIGHT_EYE", "EYEBROW_LEFT", "EYEBROW_RIGHT", "LIPS_OUTER")
+    cv2.fillPoly(half, [scale(landmarks[face_points[n]]) for n in holes], 0.0)
+    k = max(3, (kernel // 2) | 1)
+    half = cv2.erode(half, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    half = cv2.GaussianBlur(half, (k, k), 0)
+    return cv2.resize(half, (width, height), interpolation=cv2.INTER_LINEAR), (int(x0), int(y0))
+
+
+
+def matched_foundation_shade(analysis: Analysis) -> tuple:
+    """(b, g, r) foundation that matches the measured skin: the skin colour, a touch lighter and less red"""
+    L, a, b = analysis.skin
+    return _lab_to_bgr((L + 2.0, a * 0.85, b))
+
+
+def apply_foundation(
+    image: np.ndarray,
+    landmarks: np.ndarray,
+    coverage: float = 0.5,
+    smoothing: float = 0.5,
+    shade=None,
+    analysis: Analysis | None = None,
+) -> np.ndarray:
+    """
+    image : BGR image as np.ndarray
+    landmarks : array from detect_landmarks
+    coverage : 0..1 how much the skin colour is evened out toward the foundation shade. covers
+               redness, blotches and dark patches like a real foundation while the shading of
+               the face (nose, jaw, cheekbones) stays
+    smoothing : 0..1 how much fine texture (pores, lines) is softened, edge preserving
+    shade : (b, g, r) foundation colour, or None to match the measured skin
+    analysis : from FaceAnalyzer, needed for a matched shade (measured here if missing)
+    returns a new image, eyes / brows / lips untouched
+    """
+    coverage, smoothing = float(np.clip(coverage, 0, 1)), float(np.clip(smoothing, 0, 1))
+    if coverage <= 0 and smoothing <= 0:
+        return image
+    if shade is None:
+        analysis = analysis or FaceAnalyzer().analyze(image, landmarks)
+        shade = matched_foundation_shade(analysis)
+    h, w = image.shape[:2]
+    kernel = feather_size(landmarks)
+    mask, (x0, y0) = _skin_mask(landmarks, kernel)
+    # clip the box to the image
+    y1, x1 = min(y0 + mask.shape[0], h), min(x0 + mask.shape[1], w)
+    cx0, cy0 = max(x0, 0), max(y0, 0)
+    mask = mask[cy0 - y0 : y1 - y0, cx0 - x0 : x1 - x0]
+    if mask.size == 0 or mask.max() <= 0:
+        return image
+
+    region = image[cy0:y1, cx0:x1]
+    lab = cv2.cvtColor(region, cv2.COLOR_BGR2LAB).astype(np.float32)
+    target = cv2.cvtColor(np.array([[shade]], np.uint8), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    L, ab = lab[..., 0], lab[..., 1:]
+    size = (lab.shape[1], lab.shape[0])
+
+    if coverage > 0:
+        # colour is handled at half size (chroma is smooth, the eye cannot tell) and the evened
+        # colour and local lightness, low frequency signals, at quarter size
+        half = (max(1, size[0] // 2), max(1, size[1] // 2))
+        quarter = cv2.resize(lab, (max(1, size[0] // 4), max(1, size[1] // 4)), interpolation=cv2.INTER_AREA)
+        ab_half = cv2.resize(ab, half, interpolation=cv2.INTER_AREA)
+        c_half = cv2.resize(mask, half, interpolation=cv2.INTER_AREA)[..., None] * coverage
+        # colour blotches (redness, spots) are smoothed away, then the colour is pulled toward
+        # the shade. never fully flat, real skin keeps some variation
+        even = cv2.resize(cv2.GaussianBlur(quarter[..., 1:], (0, 0), max(1.0, kernel * 0.25)), half, interpolation=cv2.INTER_LINEAR)
+        ab_half += (even - ab_half) * c_half
+        ab_half += (target[1:] - ab_half) * (c_half * 0.7)
+        ab = cv2.resize(ab_half, size, interpolation=cv2.INTER_LINEAR)
+        # local dark or bright patches (under the eyes, shadows) move a little toward the
+        # shade. the low frequency part only, so shape shading is kept
+        low = cv2.resize(cv2.GaussianBlur(quarter[..., 0], (0, 0), max(1.0, kernel * 0.375)), size, interpolation=cv2.INTER_LINEAR)
+        L = L + (target[0] - low) * (mask * (coverage * 0.3))
+
+    if smoothing > 0:
+        s = mask * smoothing
+        source = np.clip(L, 0, 255).astype(np.uint8)
+        # filter at half size when the face is big: faster, and finer texture goes with it
+        scale = 0.5 if min(source.shape) > 200 else 1.0
+        small = cv2.resize(source, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else source
+        diameter = max(5, int(kernel * scale) | 1)
+        smoothed = cv2.bilateralFilter(small, diameter, 30, diameter)
+        if scale < 1:
+            smoothed = cv2.resize(smoothed, (source.shape[1], source.shape[0]), interpolation=cv2.INTER_LINEAR)
+        L = L * (1 - s) + smoothed * s
+
+    lab[..., 0], lab[..., 1:] = L, ab
+    blended = cv2.cvtColor(lab.clip(0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    # only pixels the mask really covers are taken from the result, the colour round trip is lossy
+    covered = (mask > 0.02).astype(np.float32)
+    output = image.copy()
+    output[cy0:y1, cx0:x1] = cv2.blendLinear(region, blended, 1 - covered, covered)
+    return output
+
+
 def apply_makeup(image: np.ndarray, face_mesh, style: dict):
     """
     image : BGR image as np.ndarray

@@ -45,6 +45,8 @@ from PySide6.QtWidgets import (
 
 from utils import (
     FEATURES,
+    FaceAnalyzer,
+    adapt_style,
     bgr_to_hex,
     blur_background,
     camera_format,
@@ -58,6 +60,8 @@ from utils import (
     open_camera,
     probe_camera,
     remember_camera_mode,
+    matched_foundation_shade,
+    apply_foundation,
     render_makeup,
 )
 
@@ -115,6 +119,11 @@ class Settings:
     """everything the UI controls, handed to the Processor as one immutable snapshot"""
 
     style: dict  # {feature: {"color": (b, g, r), "alpha": 0..1, "enabled": bool}}
+    adaptive: bool = True  # move the shades to the skin tone and the light
+    foundation: bool = False
+    foundation_shade: tuple | None = None  # (b, g, r), None matches the skin
+    coverage: float = 0.5  # foundation colour evening 0..1
+    smoothing: float = 0.4  # foundation texture smoothing 0..1
     blur_background: bool = False
     blur_strength: float = 0.05
     compare: bool = False
@@ -151,6 +160,8 @@ class Processor(QThread):
     failed = Signal(str)
     test_progress = Signal(str)  # webcam test: what is being measured right now
     test_finished = Signal(list)  # webcam test: rows from utils.probe_camera
+    analysis_changed = Signal(str)  # what the shades are adapted to, empty when no face
+    shade_matched = Signal(str)  # foundation shade matched to the skin, as #rrggbb
 
     def __init__(self, settings: Settings):
         super().__init__()
@@ -195,9 +206,11 @@ class Processor(QThread):
         face_video = create_face_mesh(static_image_mode=False)
         face_static = create_face_mesh(static_image_mode=True)
         segmenter = create_segmenter()
+        analyzer = FaceAnalyzer()
         capture, capture_index = None, None
-        image_id, image_landmarks = None, None
+        image_id, image_landmarks, image_analysis = None, None, None
         rendered_version = -1
+        last_description, last_shade = None, None
         frames, t_fps = 0, time.perf_counter()
 
         while self._running:
@@ -235,6 +248,7 @@ class Processor(QThread):
                         continue
                     width, height = camera_resolution(capture)
                     self.source_changed.emit(f"Webcam {index}  {width}x{height} {camera_format(capture)}")
+                    analyzer.reset()
                 ok, frame = capture.read()
                 if not ok:
                     self._report(f"Webcam {index} stopped delivering frames")
@@ -255,11 +269,35 @@ class Processor(QThread):
                 frame = payload
                 if id(payload) != image_id:
                     image_landmarks, image_id = detect_landmarks(frame, face_static), id(payload)
+                    image_analysis = analyzer.analyze(frame, image_landmarks) if image_landmarks is not None else None
                     self.source_changed.emit(f"Image  {frame.shape[1]}x{frame.shape[0]}")
                 landmarks = image_landmarks
                 rendered_version = version
 
-            output = render_makeup(frame, landmarks, settings.style) if landmarks is not None else frame
+            if landmarks is None:
+                output = frame
+                description = ""
+            else:
+                style = settings.style
+                description = ""
+                match_shade = settings.foundation and settings.foundation_shade is None
+                analysis = None
+                if settings.adaptive or match_shade:
+                    analysis = analyzer.update(frame, landmarks) if kind == "camera" else image_analysis
+                if settings.adaptive:
+                    style = adapt_style(style, analysis)
+                    description = analysis.describe()
+                output = frame
+                if settings.foundation:
+                    shade = settings.foundation_shade or matched_foundation_shade(analysis)
+                    output = apply_foundation(frame, landmarks, settings.coverage, settings.smoothing, shade, analysis)
+                    if match_shade and bgr_to_hex(shade) != last_shade:
+                        last_shade = bgr_to_hex(shade)
+                        self.shade_matched.emit(last_shade)
+                output = render_makeup(output, landmarks, style)
+            if description != last_description:
+                self.analysis_changed.emit(description)
+                last_description = description
             if settings.blur_background:
                 output = blur_background(output, segmenter, settings.blur_strength)
             if settings.compare:
@@ -344,13 +382,14 @@ class FeatureRow(QWidget):
         self.value.setFixedWidth(36)
         self.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        grid = QGridLayout(self)
-        grid.setContentsMargins(0, 2, 0, 2)
-        grid.setHorizontalSpacing(8)
-        grid.addWidget(self.enabled, 0, 0)
-        grid.addWidget(self.swatch, 0, 1, alignment=Qt.AlignmentFlag.AlignRight)
-        grid.addWidget(self.slider, 1, 0)
-        grid.addWidget(self.value, 1, 1)
+        self.enabled.setFixedWidth(96)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 2, 0, 2)
+        row.setSpacing(8)
+        row.addWidget(self.enabled)
+        row.addWidget(self.slider, 1)
+        row.addWidget(self.value)
+        row.addWidget(self.swatch)
 
         self.enabled.toggled.connect(self._on_toggle)
         self.swatch.clicked.connect(self._pick_color)
@@ -494,7 +533,7 @@ class MainWindow(QMainWindow):
     def __init__(self, presets: dict, image_path: str | None = None):
         super().__init__()
         self.setWindowTitle("Virtual Makeup")
-        self.resize(1200, 820)
+        self.resize(1200, 840)
         self.presets = presets
         self._image = None  # the currently opened still image, if any
         self._loading = False  # True while a preset fills the rows, suppresses pushes
@@ -525,6 +564,8 @@ class MainWindow(QMainWindow):
         self.processor.frame_ready.connect(self._on_frame)
         self.processor.fps_changed.connect(self._on_fps)
         self.processor.source_changed.connect(self.source_label.setText)
+        self.processor.analysis_changed.connect(self._on_analysis)
+        self.processor.shade_matched.connect(self._on_shade_matched)
         self.processor.failed.connect(self.view.set_message)
         self.processor.start()
         self._add_shortcuts()
@@ -593,7 +634,67 @@ class MainWindow(QMainWindow):
             feature_row.changed.connect(self._push_settings)
             self.rows[key] = feature_row
             rows.addWidget(feature_row)
+        self.adaptive_check = QCheckBox("Adapt shades to skin and light")
+        self.adaptive_check.setChecked(True)
+        self.adaptive_check.setToolTip(
+            "Moves every shade toward the skin undertone, deepens it on deeper skin, gives it more "
+            "colour where a pale shade would vanish, and scales the intensity with the brightness of "
+            "the image. Brows take your own brow colour."
+        )
+        self.adaptive_check.toggled.connect(self._push_settings)
+        self.analysis_label = QLabel("")
+        self.analysis_label.setObjectName("dim")
+        self.analysis_label.setWordWrap(True)
+        rows.addSpacing(4)
+        rows.addWidget(self.adaptive_check)
+        rows.addWidget(self.analysis_label)
         column.addWidget(makeup_box)
+
+        foundation_box = QGroupBox("Foundation")
+        grid = QGridLayout(foundation_box)
+        self.foundation_check = QCheckBox("Foundation")
+        self.foundation_check.setToolTip("Evens out the skin colour and softens texture, eyes, brows and lips stay untouched")
+        self.foundation_check.toggled.connect(self._on_foundation_toggle)
+        self.match_check = QCheckBox("Match skin")
+        self.match_check.setChecked(True)
+        self.match_check.setToolTip("Use a shade measured from the skin, untick to pick one")
+        self.match_check.toggled.connect(self._on_match_toggle)
+        self.shade_swatch = QPushButton()
+        self.shade_swatch.setFixedSize(34, 24)
+        self.shade_swatch.setToolTip("Foundation shade")
+        self.shade_swatch.clicked.connect(self._pick_shade)
+        self._shade = (160, 190, 220)
+        self._set_shade_swatch(self._shade)
+        self.coverage_slider = QSlider(Qt.Orientation.Horizontal)
+        self.coverage_slider.setRange(0, 100)
+        self.coverage_slider.setValue(50)
+        self.coverage_slider.setToolTip("How much redness, blotches and dark patches are evened out")
+        self.smooth_slider = QSlider(Qt.Orientation.Horizontal)
+        self.smooth_slider.setRange(0, 100)
+        self.smooth_slider.setValue(40)
+        self.smooth_slider.setToolTip("How much fine skin texture is softened")
+        self.coverage_value, self.smooth_value = QLabel("50%"), QLabel("40%")
+        labels = {}
+        for key, text in (("coverage", "Coverage"), ("smooth", "Smooth")):
+            labels[key] = QLabel(text)
+            labels[key].setObjectName("dim")
+        for value in (self.coverage_value, self.smooth_value):
+            value.setObjectName("dim")
+            value.setFixedWidth(36)
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.coverage_slider.valueChanged.connect(lambda v: (self.coverage_value.setText(f"{v}%"), self._push_settings()))
+        self.smooth_slider.valueChanged.connect(lambda v: (self.smooth_value.setText(f"{v}%"), self._push_settings()))
+        grid.addWidget(self.foundation_check, 0, 0)
+        grid.addWidget(self.match_check, 0, 1, alignment=Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(self.shade_swatch, 0, 2, alignment=Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(labels["coverage"], 1, 0)
+        grid.addWidget(self.coverage_slider, 1, 1)
+        grid.addWidget(self.coverage_value, 1, 2)
+        grid.addWidget(labels["smooth"], 2, 0)
+        grid.addWidget(self.smooth_slider, 2, 1)
+        grid.addWidget(self.smooth_value, 2, 2)
+        self._set_foundation_enabled(False)
+        column.addWidget(foundation_box)
 
         background_box = QGroupBox("Background")
         grid = QGridLayout(background_box)
@@ -647,6 +748,11 @@ class MainWindow(QMainWindow):
     def _settings(self) -> Settings:
         return Settings(
             style={key: row.state() for key, row in self.rows.items()},
+            adaptive=self.adaptive_check.isChecked(),
+            foundation=self.foundation_check.isChecked(),
+            foundation_shade=None if self.match_check.isChecked() else self._shade,
+            coverage=self.coverage_slider.value() / 100,
+            smoothing=self.smooth_slider.value() / 100,
             blur_background=self.blur_check.isChecked(),
             blur_strength=self.blur_slider.value() / 100,
             compare=self.compare_check.isChecked(),
@@ -667,6 +773,37 @@ class MainWindow(QMainWindow):
     def _apply_preset(self, index: int):
         self._load_preset(index)
         self._push_settings()
+
+    def _set_foundation_enabled(self, enabled: bool):
+        for widget in (self.match_check, self.coverage_slider, self.smooth_slider):
+            widget.setEnabled(enabled)
+        self.shade_swatch.setEnabled(enabled and not self.match_check.isChecked())
+
+    def _on_foundation_toggle(self, checked: bool):
+        self._set_foundation_enabled(checked)
+        self._push_settings()
+
+    def _on_match_toggle(self, checked: bool):
+        self.shade_swatch.setEnabled(not checked and self.foundation_check.isChecked())
+        self._push_settings()
+
+    def _set_shade_swatch(self, color):
+        self._shade = tuple(int(c) for c in color)
+        self.shade_swatch.setStyleSheet(f"background: {bgr_to_hex(self._shade)}; border: 1px solid #4a4e5a; border-radius: 6px;")
+
+    def _on_shade_matched(self, hex_color: str):
+        # show the measured shade, it becomes the starting point if the user picks one
+        if self.match_check.isChecked():
+            self._set_shade_swatch(hex_to_bgr(hex_color))
+
+    def _pick_shade(self):
+        color = QColorDialog.getColor(QColor(bgr_to_hex(self._shade)), self, "Foundation shade")
+        if color.isValid():
+            self._set_shade_swatch(hex_to_bgr(color.name()))
+            self._push_settings()
+
+    def _on_analysis(self, description: str):
+        self.analysis_label.setText(f"Adapted for {description}" if description else "")
 
     def _on_blur_toggle(self, checked: bool):
         self.blur_slider.setEnabled(checked)
