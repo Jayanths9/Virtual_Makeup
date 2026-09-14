@@ -13,10 +13,24 @@ from utils import (
     create_segmenter,
     load_presets,
     open_camera,
+    probe_camera,
 )
 
 WINDOW = "Virtual Makeup"
 DISPLAY_MAX_WIDTH = 1280
+
+
+def test_camera(index=0):
+    """measure every webcam mode and print the table, the recommended one becomes the auto choice"""
+    print("Testing webcam modes, each switch takes a few seconds...")
+    rows = probe_camera(index, progress=lambda text: print("  " + text))
+    if not rows:
+        sys.exit("Could not open camera.")
+    print()
+    print("  %-7s %-11s %-7s %-9s %s" % ("mode", "delivered", "format", "fps", "verdict"))
+    for row in rows:
+        verdict = "recommended, used by auto" if row["recommended"] else "smooth" if row["smooth"] else "too slow"
+        print("  %-7s %-11s %-7s %5.1f     %s" % (row["mode"], "%dx%d" % row["size"], row["format"], row["fps"], verdict))
 
 
 def main(preset=None, blur_bg=False, resolution="auto"):
@@ -73,5 +87,9 @@ if __name__ == "__main__":
     parser.add_argument("--blur-background", action="store_true", help="Start with the background blurred (press b to toggle).")
     parser.add_argument("--resolution", choices=CAMERA_RESOLUTION_CHOICES, default="auto",
                         help="Webcam mode: auto picks the largest that still runs smoothly (default).")
+    parser.add_argument("--test", action="store_true", help="Measure every webcam mode, print the results and exit.")
     args = parser.parse_args()
-    main(preset=args.preset, blur_bg=args.blur_background, resolution=args.resolution)
+    if args.test:
+        test_camera()
+    else:
+        main(preset=args.preset, blur_bg=args.blur_background, resolution=args.resolution)

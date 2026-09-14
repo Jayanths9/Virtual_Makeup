@@ -339,6 +339,59 @@ def _probe(camera: _Camera, names: list, need_fps: bool):
     return best
 
 
+def remember_camera_mode(index: int, size: tuple, mjpg: bool):
+    """make "auto" open this webcam in the given mode from now on"""
+    cache = _read_camera_cache()
+    cache[str(index)] = {"size": [int(size[0]), int(size[1])], "mjpg": bool(mjpg)}
+    _write_camera_cache(cache)
+
+
+def probe_camera(index: int = 0, progress=None) -> list:
+    """
+    measure every mode of a webcam, native format first and MJPG where the native one is too
+    slow. takes a while: each mode switch is a multi second stream rebuild on some drivers.
+
+    index : webcam number
+    progress : optional callable taking a short status string, called before every measurement
+    returns rows in the order tested, each
+        {"mode": "720p", "size": (w, h), "format": "MJPG", "fps": 30.5, "mjpg": True,
+         "smooth": True, "recommended": False}
+    the recommended row is the largest smooth mode up to AUTO_MAX_MODE, it is also remembered
+    as the "auto" choice. an empty list means the webcam could not be opened.
+    """
+    camera = _Camera(index)
+    if camera.capture is None:
+        return []
+    rows = []
+    for name, size in CAMERA_MODES.items():
+        for mjpg in (False, True):
+            if progress:
+                progress(f"Testing {name} {'MJPG' if mjpg else 'native'}...")
+            delivered = camera.set_mode(size, mjpg)
+            if delivered is None or delivered[0] < size[0]:
+                # the camera cannot do this size, it will not do anything bigger either
+                break
+            fps = camera.fps(frames=15, budget=1.5)
+            fmt = camera_format(camera.capture)
+            rows.append({"mode": name, "size": delivered, "format": fmt, "fps": fps, "mjpg": mjpg,
+                         "smooth": fps >= MIN_SMOOTH_FPS, "recommended": False})
+            if fps >= MIN_SMOOTH_FPS or fmt == "MJPG":
+                # smooth already, or MJPG is what we just tried: no point testing the other format
+                break
+        else:
+            continue
+        if delivered is None or delivered[0] < size[0]:
+            break
+    camera.capture.release()
+
+    usable = [r for r in rows if r["smooth"] and list(CAMERA_MODES).index(r["mode"]) <= list(CAMERA_MODES).index(AUTO_MAX_MODE)]
+    if usable:
+        best = max(usable, key=lambda r: r["size"][0] * r["size"][1])
+        best["recommended"] = True
+        remember_camera_mode(index, best["size"], best["mjpg"])
+    return rows
+
+
 def open_camera(index: int = 0, resolution: str = "auto"):
     """
     index : webcam number
@@ -395,8 +448,9 @@ def camera_resolution(capture) -> tuple:
 def camera_format(capture) -> str:
     """four character code of the frame format the capture is delivering, e.g. YUY2 or MJPG"""
     code = int(capture.get(cv2.CAP_PROP_FOURCC))
-    name = "".join(chr((code >> (8 * i)) & 0xFF) for i in range(4))
-    return name if name.isprintable() and name.strip() else "?"
+    name = "".join(chr((code >> (8 * i)) & 0xFF) for i in range(4)).strip()
+    # real codes are short ascii names like YUY2, MJPG or NV12, anything else is garbage
+    return name if name.isascii() and name.isalnum() else "?"
 
 
 # to display image in cv2 window

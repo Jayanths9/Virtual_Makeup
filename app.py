@@ -18,14 +18,18 @@ import cv2
 from PySide6.QtCore import QMutex, QMutexLocker, QRect, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -33,6 +37,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +56,8 @@ from utils import (
     hex_to_bgr,
     load_presets,
     open_camera,
+    probe_camera,
+    remember_camera_mode,
     render_makeup,
 )
 
@@ -96,6 +104,9 @@ QScrollBar::handle:vertical:hover { background: #4a4e5a; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QToolTip { background: #2a2c33; color: #e8e8ea; border: 1px solid #363944; }
+QTableWidget { background: #101114; gridline-color: #2a2c33; border: 1px solid #2a2c33; border-radius: 6px; selection-background-color: #e0567a; selection-color: white; }
+QHeaderView::section { background: #2a2c33; color: #9aa0ab; border: none; padding: 6px; font-weight: 600; }
+QDialog { background: #17181c; }
 """
 
 
@@ -138,6 +149,8 @@ class Processor(QThread):
     fps_changed = Signal(float)
     source_changed = Signal(str)  # human readable description of the active source
     failed = Signal(str)
+    test_progress = Signal(str)  # webcam test: what is being measured right now
+    test_finished = Signal(list)  # webcam test: rows from utils.probe_camera
 
     def __init__(self, settings: Settings):
         super().__init__()
@@ -145,6 +158,7 @@ class Processor(QThread):
         self._settings = settings
         self._source = ("camera", (0, "auto"))  # ("camera", (index, resolution)) or ("image", ndarray)
         self._version = 0  # bumped on every settings / source change
+        self._reopen = False  # the webcam must be opened again even if the source looks the same
         self._running = True
         self._last_error = None
 
@@ -154,14 +168,22 @@ class Processor(QThread):
             self._settings = settings
             self._version += 1
 
-    def use_camera(self, index: int = 0, resolution: str = "auto"):
+    def use_camera(self, index: int = 0, resolution: str = "auto", reopen: bool = False):
+        """reopen forces a fresh open, needed when the remembered auto mode changed"""
         with QMutexLocker(self._lock):
             self._source = ("camera", (index, resolution))
+            self._reopen = self._reopen or reopen
             self._version += 1
 
     def use_image(self, image):
         with QMutexLocker(self._lock):
             self._source = ("image", image)
+            self._version += 1
+
+    def test_camera(self, index: int = 0):
+        """measure every mode of the webcam, then go back to it in auto mode"""
+        with QMutexLocker(self._lock):
+            self._source = ("test", index)
             self._version += 1
 
     def stop(self):
@@ -181,10 +203,25 @@ class Processor(QThread):
         while self._running:
             with QMutexLocker(self._lock):
                 settings, (kind, payload), version = self._settings, self._source, self._version
+                reopen, self._reopen = self._reopen, False
+
+            if kind == "test":
+                # the test needs the webcam to itself
+                if capture is not None:
+                    capture.release()
+                    capture, capture_index = None, None
+                self.failed.emit(f"Testing webcam {payload}…")
+                rows = probe_camera(payload, progress=self.test_progress.emit)
+                self.test_finished.emit(rows)
+                with QMutexLocker(self._lock):
+                    if self._source == ("test", payload):
+                        self._source = ("camera", (payload, "auto"))
+                        self._version += 1
+                continue
 
             if kind == "camera":
                 index, resolution = payload
-                if capture is None or capture_index != payload:
+                if capture is None or capture_index != payload or reopen:
                     if capture is not None:
                         capture.release()
                     if resolution in ("detect", "max") or (resolution == "auto" and not camera_is_known(index)):
@@ -356,6 +393,103 @@ class FeatureRow(QWidget):
             self.changed.emit()
 
 
+class CameraTestDialog(QDialog):
+    """
+    runs utils.probe_camera through the Processor and shows every measured mode.
+    the user can take the recommendation or pick any row.
+    """
+
+    COLUMNS = ("Mode", "Delivered", "Format", "Frame rate", "Verdict")
+
+    def __init__(self, processor: Processor, index: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Webcam {index} test")
+        self.resize(560, 360)
+        self.processor = processor
+        self.index = index
+        self.rows = []
+        self.changed = False
+
+        self.status = QLabel("Measuring every mode, native and MJPG. Each switch takes a few seconds…")
+        self.status.setWordWrap(True)
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._on_selection)
+
+        self.buttons = QDialogButtonBox()
+        self.use_button = self.buttons.addButton("Use selected", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.use_button.setObjectName("accent")
+        self.use_button.setEnabled(False)
+        self.buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        self.buttons.accepted.connect(self._use_selected)
+        self.buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(self.buttons)
+
+        processor.test_progress.connect(self.status.setText)
+        processor.test_finished.connect(self._on_finished)
+        processor.test_camera(index)
+
+    def _on_finished(self, rows: list):
+        self.rows = rows
+        self.table.setRowCount(len(rows))
+        recommended = None
+        for i, row in enumerate(rows):
+            verdict = "recommended" if row["recommended"] else "smooth" if row["smooth"] else "too slow"
+            cells = (
+                row["mode"],
+                f"{row['size'][0]}x{row['size'][1]}",
+                row["format"],
+                f"{row['fps']:.0f} fps",
+                verdict,
+            )
+            for column, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if row["recommended"]:
+                    item.setForeground(QColor(ACCENT))
+                elif not row["smooth"]:
+                    item.setForeground(QColor("#8a8f98"))
+                self.table.setItem(i, column, item)
+            if row["recommended"]:
+                recommended = i
+        if not rows:
+            self.status.setText(f"Webcam {self.index} could not be opened.")
+        elif recommended is None:
+            self.status.setText("No mode runs smoothly. The webcam stays in its default mode.")
+        else:
+            self.status.setText(
+                "Done. The recommended mode is the largest one that runs smoothly and is now used for Auto. "
+                "Select another row and press Use selected to override it."
+            )
+            self.table.selectRow(recommended)
+
+    def _on_selection(self):
+        self.use_button.setEnabled(bool(self.table.selectedItems()))
+
+    def done(self, result: int):
+        # the test keeps running in the processor if the dialog is closed early, stop listening
+        self.processor.test_progress.disconnect(self.status.setText)
+        self.processor.test_finished.disconnect(self._on_finished)
+        super().done(result)
+
+    def _use_selected(self):
+        selected = self.table.selectedItems()
+        if selected:
+            row = self.rows[selected[0].row()]
+            remember_camera_mode(self.index, row["size"], row["mjpg"])
+            # the processor already went back to the recommended mode, a different choice needs a reopen
+            self.changed = not row["recommended"]
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, presets: dict, image_path: str | None = None):
         super().__init__()
@@ -427,11 +561,15 @@ class MainWindow(QMainWindow):
         self.quality_combo.currentIndexChanged.connect(self._on_source_changed)
         quality_label = QLabel("Quality")
         quality_label.setObjectName("dim")
+        test_button = QPushButton("Test webcam…")
+        test_button.setToolTip("Measure every mode of the webcam and pick the one to use")
+        test_button.clicked.connect(self._test_camera)
         grid = QGridLayout(source_box)
         grid.addWidget(self.source_combo, 0, 0, 1, 2)
         grid.addWidget(open_button, 0, 2)
         grid.addWidget(quality_label, 1, 0)
-        grid.addWidget(self.quality_combo, 1, 1, 1, 2)
+        grid.addWidget(self.quality_combo, 1, 1)
+        grid.addWidget(test_button, 1, 2)
         column.addWidget(source_box)
 
         preset_box = QGroupBox("Preset")
@@ -542,6 +680,19 @@ class MainWindow(QMainWindow):
             self.processor.use_camera(index, QUALITY_OPTIONS[self.quality_combo.currentText()])
         elif self._image is not None:
             self.processor.use_image(self._image)
+
+    def _test_camera(self):
+        index = min(self.source_combo.currentIndex(), CAMERA_SLOTS - 1)
+        dialog = CameraTestDialog(self.processor, index, self)
+        dialog.exec()
+        # the test leaves the webcam in auto mode, whatever was chosen in the dialog is what auto opens
+        self.quality_combo.blockSignals(True)
+        self.quality_combo.setCurrentText("Auto")
+        self.quality_combo.blockSignals(False)
+        self.source_combo.blockSignals(True)
+        self.source_combo.setCurrentIndex(index)
+        self.source_combo.blockSignals(False)
+        self.processor.use_camera(index, "auto", reopen=dialog.changed)
 
     def _open_image_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")

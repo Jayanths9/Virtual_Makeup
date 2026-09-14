@@ -26,7 +26,8 @@ python app.py                          # webcam
 python app.py --image sample/face.png  # start on an image
 ```
 
-- **Source** - switch between webcams or open an image. **Quality** picks the webcam mode: *Auto* measures which modes the camera runs smoothly and takes the largest one up to 1080p (measured once, about 15 s, then remembered in `~/.virtual_makeup/cameras.json`); *480p / 720p / 1080p* force a mode; *Max* takes the biggest size the camera has even if it is slow.
+- **Source** - switch between webcams or open an image. **Quality** picks the webcam mode: *Auto* takes the largest mode that runs smoothly, up to 1080p (measured once, then remembered in `~/.virtual_makeup/cameras.json`); *480p / 720p / 1080p* force a mode; *Max* takes the biggest size the camera has even if it is slow.
+- **Test webcam** - measures every mode of the camera, native and MJPG, and shows a table of what it really delivers (size, format, frame rate). Takes about 40 s. The recommended row becomes the *Auto* choice; select any other row and press *Use selected* to override it.
 - **Preset** - pick a look from `presets.json`, then tweak it: every feature has an on/off switch, a colour swatch (click to pick a colour) and an intensity slider. *Reset* goes back to the preset values.
 - **Background** - blur everything except the person, with a strength slider.
 - **Compare before / after** - split view with the original on the left.
@@ -50,6 +51,7 @@ python camera.py --preset Evening --blur-background --resolution 720p
 ```
 In the video window: `q` quits, `b` toggles the background blur, `1`..`5` switch preset.
 `--resolution` is `auto` (default, see Quality above), `detect` (measure again), `max`, or `480p` / `720p` / `1080p` / `1440p` / `4k`.
+`python camera.py --test` measures every webcam mode and prints the table, like the Test webcam button in the app.
 
 ## Presets
 
