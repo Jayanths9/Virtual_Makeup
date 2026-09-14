@@ -1,59 +1,56 @@
-from utils import *
+import argparse
+import sys
 
-# features to add makeup
-face_elements = [
-    "LIP_LOWER",
-    "LIP_UPPER",
-    "EYEBROW_LEFT",
-    "EYEBROW_RIGHT",
-    "EYELINER_LEFT",
-    "EYELINER_RIGHT",
-    "EYESHADOW_LEFT",
-    "EYESHADOW_RIGHT",
-]
+import cv2
 
-# change the color of features
-colors_map = {
-    # upper lip and lower lips
-    "LIP_UPPER": [0, 0, 255],  # Red in BGR
-    "LIP_LOWER": [0, 0, 255],  # Red in BGR
-    # eyeliner
-    "EYELINER_LEFT": [139, 0, 0],  # Dark Blue in BGR
-    "EYELINER_RIGHT": [139, 0, 0],  # Dark Blue in BGR
-    # eye shadow
-    "EYESHADOW_LEFT": [0, 100, 0],  # Dark Green in BGR
-    "EYESHADOW_RIGHT": [0, 100, 0],  # Dark Green in BGR
-    # eye brow
-    "EYEBROW_LEFT": [19, 69, 139],  # Dark Brown in BGR
-    "EYEBROW_RIGHT": [19, 69, 139],  # Dark Brown in BGR
-}
+from utils import apply_makeup, blur_background, create_face_mesh, create_segmenter, load_presets
 
 
-face_connections=[face_points[idx] for idx in face_elements]
-colors=[colors_map[idx] for idx in face_elements]
+def main(preset=None, blur_bg=False):
+    presets = load_presets()
+    names = list(presets)
+    current = names.index(preset) if preset else 0
 
-video_capture = cv2.VideoCapture(0)
-while True:
-    # read image from camera
-    success, image = video_capture.read()
-    image = cv2.flip(image, 1)
-    # if input from camera
-    if success:
-        # create a empty mask like image
-        mask = np.zeros_like(image)
-        # extract facial landmarks
-        face_landmarks = read_landmarks(image=image)
-        # create mask for facial features with color
-        mask = add_mask(
-            mask,
-            idx_to_coordinates=face_landmarks,
-        face_connections=face_connections,colors=colors
-        )
-        # combine the image and mask with w.r.to weights
-        output = cv2.addWeighted(image, 1.0, mask, 0.2, 1.0)
-        cv2.imshow("Feature", output)
-        # press q to exit the cv2 window
-        if cv2.waitKey(100) & 0xFF == ord("q"):
-            break
-video_capture.release()
-cv2.destroyAllWindows()
+    # on windows the default (MSMF) backend can hang for a long time when opening the camera,
+    # DirectShow opens it immediately. other platforms use the default backend.
+    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+    video_capture = cv2.VideoCapture(0, backend)
+    if not video_capture.isOpened():
+        sys.exit("Could not open camera.")
+
+    # create the models once and reuse them for every frame, tracking mode for video
+    with create_face_mesh(static_image_mode=False) as face_mesh, create_segmenter(video=True) as segmenter:
+        while True:
+            # read image from camera
+            success, image = video_capture.read()
+            if not success:
+                break
+            image = cv2.flip(image, 1)
+            # blend the makeup into the frame, show the raw frame if no face is found
+            output = apply_makeup(image, face_mesh, presets[names[current]])
+            if output is None:
+                output = image
+            # blur everything except the person
+            if blur_bg:
+                output = blur_background(output, segmenter)
+            cv2.imshow("Virtual Makeup", output)
+            # q quits, b toggles the background blur, 1..9 switch preset
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord("b"):
+                blur_bg = not blur_bg
+            if ord("1") <= key <= ord("9") and key - ord("1") < len(names):
+                current = key - ord("1")
+
+    video_capture.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    preset_names = list(load_presets())
+    parser = argparse.ArgumentParser(description="Webcam with facial makeup")
+    parser.add_argument("--preset", choices=preset_names, default=preset_names[0], help="Makeup preset from presets.json.")
+    parser.add_argument("--blur-background", action="store_true", help="Start with the background blurred (press b to toggle).")
+    args = parser.parse_args()
+    main(preset=args.preset, blur_bg=args.blur_background)

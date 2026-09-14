@@ -1,0 +1,32 @@
+{
+  "Natural": {
+    "lips": {"color": "#c4776b", "alpha": 0.35},
+    "eyeshadow": {"color": "#a98467", "alpha": 0.20},
+    "eyeliner": {"color": "#3b2a2a", "alpha": 0.50},
+    "eyebrows": {"color": "#4b3621", "alpha": 0.25}
+  },
+  "Classic red": {
+    "lips": {"color": "#c8102e", "alpha": 0.60},
+    "eyeshadow": {"color": "#6e5a4e", "alpha": 0.20},
+    "eyeliner": {"color": "#1a1a1a", "alpha": 0.75},
+    "eyebrows": {"color": "#3d2b1f", "alpha": 0.30}
+  },
+  "Soft glam": {
+    "lips": {"color": "#d98c8c", "alpha": 0.40},
+    "eyeshadow": {"color": "#c79a6b", "alpha": 0.30},
+    "eyeliner": {"color": "#4a3728", "alpha": 0.50},
+    "eyebrows": {"color": "#5c4033", "alpha": 0.25}
+  },
+  "Evening": {
+    "lips": {"color": "#8b1e3f", "alpha": 0.55},
+    "eyeshadow": {"color": "#3f2a56", "alpha": 0.40},
+    "eyeliner": {"color": "#101010", "alpha": 0.85},
+    "eyebrows": {"color": "#2e1f14", "alpha": 0.35}
+  },
+  "Bold": {
+    "lips": {"color": "#ff2d55", "alpha": 0.70},
+    "eyeshadow": {"color": "#1e3a8a", "alpha": 0.45},
+    "eyeliner": {"color": "#0b0b0b", "alpha": 0.90},
+    "eyebrows": {"color": "#2b1b12", "alpha": 0.40}
+  }
+}
