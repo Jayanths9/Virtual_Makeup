@@ -77,6 +77,8 @@ Makeup is blended in LAB colour space: the colour channels move toward the chose
 | `environment.yml` | Conda environment with pinned dependencies |
 | `sample/` | Sample input image and the result images shown below |
 
+The original OpenCV-only version (fixed colours, no app) lives on the [`legacy-opencv`](https://github.com/Jayanths9/Virtual_Makeup/tree/legacy-opencv) branch.
+
 ## Introduction
 
 In this project Mediapipe [1] facial landmarks and opencv is used to add makeup on facial features.
