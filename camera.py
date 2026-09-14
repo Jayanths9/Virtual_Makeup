@@ -17,8 +17,7 @@ from utils import (
     open_camera,
     probe_camera,
     render_makeup,
-    apply_foundation,
-    hex_to_bgr,
+    smooth_skin,
 )
 
 WINDOW = "Virtual Makeup"
@@ -38,7 +37,7 @@ def test_camera(index=0):
         print("  %-7s %-11s %-7s %5.1f     %s" % (row["mode"], "%dx%d" % row["size"], row["format"], row["fps"], verdict))
 
 
-def main(preset=None, blur_bg=False, resolution="auto", adaptive=True, coverage=0.0, smoothing=0.0, shade=None):
+def main(preset=None, blur_bg=False, resolution="auto", adaptive=True, smoothing=0.0):
     presets = load_presets()
     names = list(presets)
     current = names.index(preset) if preset else 0
@@ -71,7 +70,7 @@ def main(preset=None, blur_bg=False, resolution="auto", adaptive=True, coverage=
                 analysis = analyzer.update(image, landmarks)
                 if adaptive:
                     style = adapt_style(style, analysis)
-                output = apply_foundation(image, landmarks, coverage, smoothing, shade, analysis)
+                output = smooth_skin(image, landmarks, smoothing, analysis)
                 output = render_makeup(output, landmarks, style)
             # blur everything except the person
             if blur_bg:
@@ -102,13 +101,10 @@ if __name__ == "__main__":
                         help="Webcam mode: auto picks the largest that still runs smoothly (default).")
     parser.add_argument("--test", action="store_true", help="Measure every webcam mode, print the results and exit.")
     parser.add_argument("--no-adapt", action="store_true", help="Use the preset shades as they are instead of adapting them to skin and light.")
-    parser.add_argument("--foundation", type=float, default=0.0, metavar="0..1", help="Foundation coverage, evens out the skin colour (default 0 = off).")
-    parser.add_argument("--smooth", type=float, default=0.0, metavar="0..1", help="Foundation texture smoothing (default 0).")
-    parser.add_argument("--foundation-shade", metavar="#rrggbb", help="Foundation shade, matched to the skin when not given.")
+    parser.add_argument("--smooth", type=float, default=0.0, metavar="0..1", help="Skin texture smoothing (default 0 = off).")
     args = parser.parse_args()
     if args.test:
         test_camera()
     else:
         main(preset=args.preset, blur_bg=args.blur_background, resolution=args.resolution,
-             adaptive=not args.no_adapt, coverage=args.foundation, smoothing=args.smooth,
-             shade=hex_to_bgr(args.foundation_shade) if args.foundation_shade else None)
+             adaptive=not args.no_adapt, smoothing=args.smooth)

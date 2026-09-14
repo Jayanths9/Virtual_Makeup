@@ -30,7 +30,7 @@ python app.py --image sample/face.png  # start on an image
 - **Test webcam** - measures every mode of the camera, native and MJPG, and shows a table of what it really delivers (size, format, frame rate). Takes about 40 s. The recommended row becomes the *Auto* choice; select any other row and press *Use selected* to override it.
 - **Preset** - pick a look from `presets.json`, then tweak it: every feature has an on/off switch, a colour swatch (click to pick a colour) and an intensity slider. *Reset* goes back to the preset values.
 - **Adapt shades to skin and light** (on by default) - the skin is measured on the cheeks, forehead and chin and every shade is moved to suit it: pulled toward the undertone (warm / neutral / cool), deepened on deeper skin, given more colour where a pale shade would vanish, and scaled in intensity with the brightness of the image. Eyebrows take your own brow colour. The label under the switch says what was measured, e.g. *light neutral skin, dim light*. The measurement is only as good as the light on the face: a face in shadow reads as deeper skin than it is.
-- **Foundation** - evens out the skin colour (redness, blotches, dark patches), lifts local dark areas a little and softens texture, while the shading of the face and the eyes, brows and lips stay as they are. *Match skin* uses a shade measured from the skin (shown in the swatch), untick it to pick a shade. *Coverage* is how much the colour is evened out, *Smooth* how much fine texture is softened.
+- **Smooth** (Skin) - softens the skin texture inside the face. Only the lightness is filtered, edge preserving, so pores and lines fade while colour, the shape of the face and the eyes, brows and lips stay exactly as they are. The effect fades out over the hairline and the neck.
 - **Background** - blur everything except the person, with a strength slider.
 - **Compare before / after** - split view with the original on the left.
 - **Save snapshot** - writes the current frame to a PNG or JPEG.
@@ -55,9 +55,9 @@ In the video window: `q` quits, `b` toggles the background blur, `1`..`5` switch
 `--resolution` is `auto` (default, see Quality above), `detect` (measure again), `max`, or `480p` / `720p` / `1080p` / `1440p` / `4k`.
 `python camera.py --test` measures every webcam mode and prints the table, like the Test webcam button in the app.
 
-Both scripts adapt the shades to the skin and the light unless `--no-adapt` is given, and take `--foundation 0..1` (coverage), `--smooth 0..1` and `--foundation-shade #rrggbb` (matched to the skin when not given):
+Both scripts adapt the shades to the skin and the light unless `--no-adapt` is given, and take `--smooth 0..1` for skin smoothing:
 ```
-python image.py --image sample/face.png --preset Evening --foundation 0.6 --smooth 0.5
+python image.py --image sample/face.png --preset Evening --smooth 0.5
 ```
 
 ## Presets
@@ -79,7 +79,7 @@ Makeup is blended in LAB colour space: the colour channels move toward the chose
 
 | File | Purpose |
 |---|---|
-| `utils.py` | The engine: facial contours, skin analysis and shade adaptation, LAB makeup blending, foundation, background blur, webcam handling, presets |
+| `utils.py` | The engine: facial contours, skin analysis and shade adaptation, LAB makeup blending, skin smoothing, background blur, webcam handling, presets |
 | `app.py` | PySide6 desktop app |
 | `image.py` | Command line: makeup on a single image |
 | `camera.py` | Command line: makeup on the webcam |
